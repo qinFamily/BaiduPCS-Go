@@ -22,7 +22,6 @@ import (
 )
 
 const (
-	requiredSliceSize = 256 * converter.KB // 256 KB
 	// DefaultUploadMaxRetry 默认上传失败最大重试次数
 	DefaultUploadMaxRetry = 3
 )
@@ -41,9 +40,9 @@ type (
 
 	utask struct {
 		ListTask
-		uploadInfo *checksum.LocalFile // 要上传的本地文件详情
-		step       StepUpload
-		savePath   string
+		localFileChecksum *checksum.LocalFileChecksum // 要上传的本地文件详情
+		step              StepUpload
+		savePath          string
 	}
 )
 
@@ -98,7 +97,7 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 
 	// 检测opt
 	if opt.Parallel <= 0 {
-		opt.Parallel = pcsconfig.Config.MaxUploadParallel()
+		opt.Parallel = pcsconfig.Config.MaxUploadParallel
 	}
 
 	if opt.MaxRetry < 0 {
@@ -117,60 +116,52 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 	}
 
 	var (
-		pcs           = GetBaiduPCS()
-		ulist         = list.New()
-		lastID        int
-		globedPathDir string
-		subSavePath   string
+		pcs         = GetBaiduPCS()
+		ulist       = list.New()
+		lastID      int
+		subSavePath string
 	)
 
 	for k := range localPaths {
-		globedPaths, err := filepath.Glob(localPaths[k])
+		walkedFiles, err := pcsutil.WalkDir(localPaths[k], "")
 		if err != nil {
-			fmt.Printf("上传文件, 匹配本地路径失败, %s\n", err)
+			fmt.Printf("警告: 遍历错误: %s\n", err)
 			continue
 		}
 
-		for k2 := range globedPaths {
-			walkedFiles, err := pcsutil.WalkDir(globedPaths[k2], "")
-			if err != nil {
-				fmt.Printf("警告: %s\n", err)
-				continue
+		for k3 := range walkedFiles {
+			var localPathDir string
+			// 针对 windows 的目录处理
+			if os.PathSeparator == '\\' {
+				walkedFiles[k3] = pcsutil.ConvertToUnixPathSeparator(walkedFiles[k3])
+				localPathDir = pcsutil.ConvertToUnixPathSeparator(filepath.Dir(localPaths[k]))
+			} else {
+				localPathDir = filepath.Dir(localPaths[k])
 			}
 
-			for k3 := range walkedFiles {
-				// 针对 windows 的目录处理
-				if os.PathSeparator == '\\' {
-					walkedFiles[k3] = pcsutil.ConvertToUnixPathSeparator(walkedFiles[k3])
-					globedPathDir = pcsutil.ConvertToUnixPathSeparator(filepath.Dir(globedPaths[k2]))
-				} else {
-					globedPathDir = filepath.Dir(globedPaths[k2])
-				}
-
-				// 避免去除文件名开头的"."
-				if globedPathDir == "." {
-					globedPathDir = ""
-				}
-
-				subSavePath = strings.TrimPrefix(walkedFiles[k3], globedPathDir)
-
-				lastID++
-				ulist.PushBack(&utask{
-					ListTask: ListTask{
-						ID:       lastID,
-						MaxRetry: opt.MaxRetry,
-					},
-					uploadInfo: checksum.NewLocalFileInfo(walkedFiles[k3], int(requiredSliceSize)),
-					savePath:   path.Clean(savePath + baidupcs.PathSeparator + subSavePath),
-				})
-
-				fmt.Printf("[%d] 加入上传队列: %s\n", lastID, walkedFiles[k3])
+			// 避免去除文件名开头的"."
+			if localPathDir == "." {
+				localPathDir = ""
 			}
+
+			subSavePath = strings.TrimPrefix(walkedFiles[k3], localPathDir)
+
+			lastID++
+			ulist.PushBack(&utask{
+				ListTask: ListTask{
+					ID:       lastID,
+					MaxRetry: opt.MaxRetry,
+				},
+				localFileChecksum: checksum.NewLocalFileChecksum(walkedFiles[k3], int(baidupcs.SliceMD5Size)),
+				savePath:          path.Clean(savePath + baidupcs.PathSeparator + subSavePath),
+			})
+
+			fmt.Printf("[%d] 加入上传队列: %s\n", lastID, walkedFiles[k3])
 		}
 	}
 
 	if lastID == 0 {
-		fmt.Printf("未检测到上传的文件, 请检查文件路径或通配符是否正确.\n")
+		fmt.Printf("未检测到上传的文件.\n")
 		return
 	}
 
@@ -234,14 +225,14 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 		task := e.Value.(*utask)
 
 		func() {
-			fmt.Printf("[%d] 准备上传: %s\n", task.ID, task.uploadInfo.Path)
+			fmt.Printf("[%d] 准备上传: %s\n", task.ID, task.localFileChecksum.Path)
 
-			err = task.uploadInfo.OpenPath()
+			err = task.localFileChecksum.OpenPath()
 			if err != nil {
 				fmt.Printf("[%d] 文件不可读, 错误信息: %s, 跳过...\n", task.ID, err)
 				return
 			}
-			defer task.uploadInfo.Close() // 关闭文件
+			defer task.localFileChecksum.Close() // 关闭文件
 
 			var (
 				panDir, panFile = path.Split(task.savePath)
@@ -249,8 +240,8 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 			panDir = path.Clean(panDir)
 
 			// 检测断点续传
-			state := uploadDatabase.Search(&task.uploadInfo.LocalFileMeta)
-			if state != nil || task.uploadInfo.LocalFileMeta.MD5 != nil { // 读取到了md5
+			state := uploadDatabase.Search(&task.localFileChecksum.LocalFileMeta)
+			if state != nil || task.localFileChecksum.LocalFileMeta.MD5 != nil { // 读取到了md5
 				task.step = StepUploadUpload
 				goto stepControl
 			}
@@ -260,7 +251,7 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 				goto stepControl
 			}
 
-			if task.uploadInfo.Length > baidupcs.MaxRapidUploadSize {
+			if task.localFileChecksum.Length > baidupcs.MaxRapidUploadSize {
 				fmt.Printf("[%d] 文件超过20GB, 无法使用秒传功能, 跳过秒传...\n", task.ID)
 				task.step = StepUploadUpload
 				goto stepControl
@@ -275,6 +266,8 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 			}
 
 		stepUploadRapidUpload:
+			// 文件大于256kb, 应该要检测秒传, 反之则不应检测秒传
+			// 经测试, 秒传文件并非一定要大于256KB
 			task.step = StepUploadRapidUpload
 			{
 				fdl, pcsError := pcs.CacheFilesDirectoriesList(panDir, baidupcs.DefaultOrderOptions)
@@ -288,42 +281,30 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 					}
 				}
 
-				if task.uploadInfo.Length >= 128*converter.MB {
+				if task.localFileChecksum.Length >= 128*converter.MB {
 					fmt.Printf("[%d] 检测秒传中, 请稍候...\n", task.ID)
 				}
 
-				task.uploadInfo.Md5Sum()
+				// 经测试, 文件的 crc32 值并非秒传文件所必需
+				task.localFileChecksum.Sum(checksum.CHECKSUM_MD5 | checksum.CHECKSUM_SLICE_MD5)
 
 				// 检测缓存, 通过文件的md5值判断本地文件和网盘文件是否一样
 				if fdl != nil {
 					for _, fd := range fdl {
 						if fd.Filename == panFile {
 							decodedMD5, _ := hex.DecodeString(fd.MD5)
-							if bytes.Compare(decodedMD5, task.uploadInfo.MD5) == 0 {
+							if bytes.Compare(decodedMD5, task.localFileChecksum.MD5) == 0 {
 								fmt.Printf("[%d] 目标文件, %s, 已存在, 跳过...\n", task.ID, task.savePath)
 								return
 							}
 						}
 					}
 				}
-			}
 
-			// 文件大于256kb, 应该要检测秒传, 反之则不应检测秒传
-			// 经测试, 秒传文件并非一定要大于256KB
-			if task.uploadInfo.Length >= requiredSliceSize {
-				// do nothing
-			}
-
-			task.uploadInfo.SliceMD5Sum()
-
-			// 经测试, 文件的 crc32 值并非秒传文件所必需
-			// task.uploadInfo.Crc32Sum()
-
-			{
-				pcsError := pcs.RapidUpload(task.savePath, hex.EncodeToString(task.uploadInfo.MD5), hex.EncodeToString(task.uploadInfo.SliceMD5), fmt.Sprint(task.uploadInfo.CRC32), task.uploadInfo.Length)
+				pcsError = pcs.RapidUpload(task.savePath, hex.EncodeToString(task.localFileChecksum.MD5), hex.EncodeToString(task.localFileChecksum.SliceMD5), fmt.Sprint(task.localFileChecksum.CRC32), task.localFileChecksum.Length)
 				if pcsError == nil {
 					fmt.Printf("[%d] 秒传成功, 保存到网盘路径: %s\n\n", task.ID, task.savePath)
-					totalSize += task.uploadInfo.Length
+					totalSize += task.localFileChecksum.Length
 					return
 				}
 
@@ -342,23 +323,25 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 			fmt.Printf("[%d] 秒传失败, 开始上传文件...\n\n", task.ID)
 
 			// 保存秒传信息
-			uploadDatabase.UpdateUploading(&task.uploadInfo.LocalFileMeta, nil)
+			uploadDatabase.UpdateUploading(&task.localFileChecksum.LocalFileMeta, nil)
 			uploadDatabase.Save()
 
 			// 秒传失败, 开始上传文件
 		stepUploadUpload:
 			task.step = StepUploadUpload
 			{
-				muer := uploader.NewMultiUploader(pcsupload.NewPCSUpload(pcs, task.savePath), rio.NewFileReaderAtLen64(task.uploadInfo.File))
-				muer.SetParallel(opt.Parallel)
-
 				var blockSize int64
 				if opt.NotSplitFile {
-					blockSize = task.uploadInfo.Length
+					blockSize = task.localFileChecksum.Length
 				} else {
-					blockSize = getBlockSize(task.uploadInfo.Length)
+					blockSize = getBlockSize(task.localFileChecksum.Length)
 				}
-				muer.SetBlockSize(blockSize)
+
+				muer := uploader.NewMultiUploader(pcsupload.NewPCSUpload(pcs, task.savePath), rio.NewFileReaderAtLen64(task.localFileChecksum.GetFile()), &uploader.MultiUploaderConfig{
+					Parallel:  opt.Parallel,
+					BlockSize: blockSize,
+					MaxRate:   pcsconfig.Config.MaxUploadRate,
+				})
 
 				// 设置断点续传
 				if state != nil {
@@ -366,41 +349,27 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 				}
 
 				exitChan := make(chan struct{})
-				muer.OnExecute(func() {
-					statusChan := muer.GetStatusChan()
-					updateChan := muer.UpdateInstanceStateChan()
-					for {
-						select {
-						case <-exitChan:
-							return
-						case v, ok := <-statusChan:
-							if !ok {
-								return
-							}
-
-							if v.TotalSize() == 0 {
-								fmt.Printf("\r[%d] Prepareing upload...", task.ID)
-								continue
-							}
-
-							fmt.Printf("\r[%d] ↑ %s/%s %s/s in %s ............", task.ID,
-								converter.ConvertFileSize(v.Uploaded(), 2),
-								converter.ConvertFileSize(v.TotalSize(), 2),
-								converter.ConvertFileSize(v.SpeedsPerSecond(), 2),
-								v.TimeElapsed(),
-							)
-						case <-updateChan:
-							uploadDatabase.UpdateUploading(&task.uploadInfo.LocalFileMeta, muer.InstanceState())
-							uploadDatabase.Save()
-						}
+				muer.OnUploadStatusEvent(func(status uploader.Status, updateChan <-chan struct{}) {
+					select {
+					case <-updateChan:
+						uploadDatabase.UpdateUploading(&task.localFileChecksum.LocalFileMeta, muer.InstanceState())
+						uploadDatabase.Save()
+					default:
 					}
+
+					fmt.Printf("\r[%d] ↑ %s/%s %s/s in %s ............", task.ID,
+						converter.ConvertFileSize(status.Uploaded(), 2),
+						converter.ConvertFileSize(status.TotalSize(), 2),
+						converter.ConvertFileSize(status.SpeedsPerSecond(), 2),
+						status.TimeElapsed(),
+					)
 				})
 				muer.OnSuccess(func() {
 					close(exitChan)
 					fmt.Printf("\n")
 					fmt.Printf("[%d] 上传文件成功, 保存到网盘路径: %s\n", task.ID, task.savePath)
-					totalSize += task.uploadInfo.Length
-					uploadDatabase.Delete(&task.uploadInfo.LocalFileMeta) // 删除
+					totalSize += task.localFileChecksum.Length
+					uploadDatabase.Delete(&task.localFileChecksum.LocalFileMeta) // 删除
 					uploadDatabase.Save()
 				})
 				muer.OnError(func(err error) {
@@ -413,7 +382,7 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 
 					switch pcsError.GetRemoteErrCode() {
 					case 31363: // block miss in superfile2, 上传状态过期
-						uploadDatabase.Delete(&task.uploadInfo.LocalFileMeta)
+						uploadDatabase.Delete(&task.localFileChecksum.LocalFileMeta)
 						uploadDatabase.Save()
 						fmt.Printf("[%d] 上传文件错误: 上传状态过期, 请重新上传\n", task.ID)
 						return

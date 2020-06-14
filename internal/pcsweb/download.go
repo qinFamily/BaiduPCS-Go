@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/iikira/BaiduPCS-Go/baidupcs"
-	"github.com/iikira/BaiduPCS-Go/baidupcs/dlinkclient"
 	"github.com/iikira/BaiduPCS-Go/baidupcs/pcserror"
 	"github.com/iikira/BaiduPCS-Go/internal/pcscommand"
 	"github.com/iikira/BaiduPCS-Go/internal/pcsconfig"
@@ -16,6 +15,7 @@ import (
 	"github.com/iikira/BaiduPCS-Go/pcsutil/waitgroup"
 	"github.com/iikira/BaiduPCS-Go/requester"
 	"github.com/iikira/BaiduPCS-Go/requester/downloader"
+	"github.com/iikira/BaiduPCS-Go/requester/transfer"
 	"github.com/oleiade/lane"
 	"golang.org/x/net/websocket"
 	"io"
@@ -53,14 +53,14 @@ var (
 	DownloaderMap = make(map[int]*downloader.Downloader)
 )
 
-type (
-	// ListTask 队列状态 (基类)
-	ListTask struct {
-		ID       int // 任务id
-		MaxRetry int // 最大重试次数
-		retry    int // 任务失败的重试次数
-	}
+// ListTask 队列状态 (基类)
+type ListTask struct {
+	ID       int // 任务id
+	MaxRetry int // 最大重试次数
+	retry    int // 任务失败的重试次数
+}
 
+type (
 	// dtask 下载任务
 	dtask struct {
 		ListTask
@@ -100,12 +100,11 @@ func downloadPrintFormat(load int) string {
 	return "[%d] ↓ %s/%s %s/s in %s, left %s ...\n"
 }
 
-func download(conn *websocket.Conn, id int, downloadURL, savePath string, loadBalansers []string, client *requester.HTTPClient, newCfg downloader.Config, downloadOptions *DownloadOptions) error {
+func download(conn *websocket.Conn, id int, fileInfo *baidupcs.FileDirectory, downloadURL, savePath string, loadBalansers []string, client *requester.HTTPClient, newCfg downloader.Config, downloadOptions *DownloadOptions) error {
 	var (
-		file     *os.File
-		writerAt io.WriterAt
-		err      error
-		exitChan chan struct{}
+		writer downloader.Writer
+		file   *os.File
+		err    error
 	)
 
 	if !newCfg.IsTest {
@@ -123,97 +122,73 @@ func download(conn *websocket.Conn, id int, downloadURL, savePath string, loadBa
 			return fmt.Errorf("%s, path %s: not a directory", StrDownloadInitError, dir)
 		}
 
-		file, err = os.OpenFile(savePath, os.O_CREATE|os.O_WRONLY, 0666)
-		if file != nil {
-			defer file.Close()
-		}
+		// 打开文件
+		writer, file, err = downloader.NewDownloaderWriterByFilename(savePath, os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
 			sendResponse(conn, 2, -4, "初始化下载发生错误", "")
 		}
-
-		// 空指针和空接口不等价
-		if file != nil {
-			writerAt = file
-		}
+		defer file.Close()
 	}
 
-	download := downloader.NewDownloader(downloadURL, writerAt, &newCfg)
+	download := downloader.NewDownloader(downloadURL, writer, &newCfg)
 	download.SetClient(client)
-	download.TryHTTP(!pcsconfig.Config.EnableHTTPS())
+	download.SetDURLCheckFunc(pcsdownload.BaiduPCSURLCheckFunc)
 	download.AddLoadBalanceServer(loadBalansers...)
 	download.SetStatusCodeBodyCheckFunc(func(respBody io.Reader) error {
 		return pcserror.DecodePCSJSONError(baidupcs.OperationDownloadFile, respBody)
 	})
 
-	exitChan = make(chan struct{})
-
-	download.OnExecute(func() {
+	var (
+		format = downloadPrintFormat(downloadOptions.Load)
+	)
+	download.OnDownloadStatusEvent(func(status transfer.DownloadStatuser, workersCallback func(downloader.RangeWorkerFunc)) {
 		DownloaderMap[id] = download
 		if downloadOptions.IsPrintStatus {
-			go func() {
-				for {
-					time.Sleep(1 * time.Second)
-					select {
-					case <-exitChan:
-						return
-					default:
-						download.PrintAllWorkers()
-					}
-				}
-			}()
+			// 输出所有的worker状态
+			var (
+				builder = &strings.Builder{}
+				tb      = pcstable.NewTable(builder)
+			)
+			tb.SetHeader([]string{"#", "status", "range", "left", "speeds", "error"})
+			workersCallback(func(key int, worker *downloader.Worker) bool {
+				wrange := worker.GetRange()
+				tb.Append([]string{fmt.Sprint(worker.ID()), worker.GetStatus().StatusText(), wrange.ShowDetails(), strconv.FormatInt(wrange.Len(), 10), strconv.FormatInt(worker.GetSpeedsPerSecond(), 10), fmt.Sprint(worker.Err())})
+				return true
+			})
+			tb.Render()
+			fmt.Fprintf(downloadOptions.Out, "\n\n"+builder.String())
+		}
+		var leftStr string
+		downloaded, totalSize, speeds := status.Downloaded(), status.TotalSize(), status.SpeedsPerSecond()
+		if speeds <= 0 {
+			leftStr = "-"
+		} else {
+			leftStr = (time.Duration((totalSize-downloaded)/(speeds)) * time.Second).String()
 		}
 
-		if newCfg.IsTest {
-			fmt.Fprintf(downloadOptions.Out, "[%d] 测试下载开始\n\n", id)
+		var avgSpeed int64 = 0
+		timeUsed := status.TimeElapsed()/1e7*1e7
+		timeSecond := status.TimeElapsed().Seconds()
+		if(int64(timeSecond) > 0){
+			avgSpeed = downloaded / int64(timeSecond)
 		}
+		//fmt.Println(timeUsed, timeSecond, avgSpeed)
 
-		var (
-			ds                            = download.GetDownloadStatusChan()
-			format                        = downloadPrintFormat(downloadOptions.Load)
-			downloaded, totalSize, speeds int64
-			leftStr                       string
+		fmt.Fprintf(downloadOptions.Out, format, id,
+			converter.ConvertFileSize(downloaded, 2),
+			converter.ConvertFileSize(totalSize, 2),
+			converter.ConvertFileSize(speeds, 2),
+			timeUsed, leftStr,
 		)
-		for {
-			select {
-			case <-exitChan:
-				return
-			case v, ok := <-ds:
-				if !ok { // channel 已经关闭
-					return
-				}
 
-				downloaded, totalSize, speeds = v.Downloaded(), v.TotalSize(), v.SpeedsPerSecond()
-				if speeds <= 0 {
-					leftStr = "-"
-				} else {
-					leftStr = (time.Duration((totalSize-downloaded)/(speeds)) * time.Second).String()
-				}
-
-				var avgSpeed int64 = 0
-				timeUsed := v.TimeElapsed()/1e7*1e7
-				timeSecond := v.TimeElapsed().Seconds()
-				if(int64(timeSecond) > 0){
-					avgSpeed = downloaded / int64(timeSecond)
-				}
-				//fmt.Println(timeUsed, timeSecond, avgSpeed)
-
-				fmt.Fprintf(downloadOptions.Out, format, id,
-					converter.ConvertFileSize(downloaded, 2),
-					converter.ConvertFileSize(totalSize, 2),
-					converter.ConvertFileSize(speeds, 2),
-					timeUsed, leftStr,
-				)
-
-				MsgBody = fmt.Sprintf("{\"LastID\": %d, \"download_size\": \"%s\", \"total_size\": \"%s\", \"percent\": %.2f, \"speed\": \"%s\", \"avg_speed\": \"%s\", \"time_used\": \"%s\", \"time_left\": \"%s\"}", id,
-					converter.ConvertFileSize(downloaded, 2),
-					converter.ConvertFileSize(totalSize, 2),
-					float64(downloaded) / float64(totalSize) * 100,
-					converter.ConvertFileSize(speeds, 2),
-					converter.ConvertFileSize(avgSpeed, 2),
-					timeUsed, leftStr)
-				sendResponse(conn, 2, 5, "下载中", MsgBody)
-			}
-		}
+		MsgBody = fmt.Sprintf("{\"LastID\": %d, \"download_size\": \"%s\", \"total_size\": \"%s\", \"percent\": %.2f, \"speed\": \"%s\", \"avg_speed\": \"%s\", \"time_used\": \"%s\", \"time_left\": \"%s\"}", id,
+			converter.ConvertFileSize(downloaded, 2),
+			converter.ConvertFileSize(totalSize, 2),
+			float64(downloaded) / float64(totalSize) * 100,
+			converter.ConvertFileSize(speeds, 2),
+			converter.ConvertFileSize(avgSpeed, 2),
+			timeUsed, leftStr)
+		sendResponse(conn, 2, 5, "下载中", MsgBody)
 	})
 	download.OnPause(func() {
 		MsgBody = fmt.Sprintf("{\"LastID\": %d}", id)
@@ -236,16 +211,19 @@ func download(conn *websocket.Conn, id int, downloadURL, savePath string, loadBa
 	})
 
 	err = download.Execute()
-	close(exitChan)
 	fmt.Fprintf(downloadOptions.Out, "\n")
 	if err != nil {
-		// 下载失败, 删去空文件
-		if info, infoErr := file.Stat(); infoErr == nil {
-			if info.Size() == 0 {
-				pcsCommandVerbose.Infof("[%d] remove empty file: %s\n", id, savePath)
-				os.Remove(savePath)
+			// 下载失败, 删去空文件
+			if info, infoErr := file.Stat(); infoErr == nil {
+				if info.Size() == 0 {
+					pcsCommandVerbose.Infof("[%d] remove empty file: %s\n", id, savePath)
+					removeErr := os.Remove(savePath)
+					if removeErr != nil {
+						pcsCommandVerbose.Infof("[%d] remove file error: %s\n", id, removeErr)
+					}
+				}
 			}
-		}
+		
 		return err
 	}
 
@@ -274,7 +252,7 @@ func checkFileValid(filePath string, fileInfo *baidupcs.FileDirectory) error {
 		return ErrDownloadNotSupportChecksum
 	}
 
-	f := checksum.NewLocalFileInfo(filePath, int(256*converter.KB))
+	f := checksum.NewLocalFileChecksum(filePath, int(baidupcs.SliceMD5Size))
 	err := f.OpenPath()
 	if err != nil {
 		return err
@@ -282,10 +260,13 @@ func checkFileValid(filePath string, fileInfo *baidupcs.FileDirectory) error {
 
 	defer f.Close()
 
-	f.Md5Sum()
+	err = f.Sum(checksum.CHECKSUM_MD5)
+	if err != nil {
+		return err
+	}
 	md5Str := hex.EncodeToString(f.MD5)
 
-	if strings.Compare(md5Str, fileInfo.MD5) != 0 {
+	if md5Str != fileInfo.MD5 { // md5不一致
 		// 检测是否为违规文件
 		if pcsdownload.IsSkipMd5Checksum(f.Length, md5Str) {
 			return ErrDownloadFileBanned
@@ -306,7 +287,7 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 	}
 
 	if options.Load <= 0 {
-		options.Load = pcsconfig.Config.MaxDownloadLoad()
+		options.Load = pcsconfig.Config.MaxDownloadLoad
 	}
 
 	if options.MaxRetry < 0 {
@@ -315,13 +296,18 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 
 	// 设置下载配置
 	cfg := &downloader.Config{
-		IsTest:    options.IsTest,
-		CacheSize: pcsconfig.Config.CacheSize(),
+		Mode:                       transfer.RangeGenMode_BlockSize,
+		CacheSize:                  pcsconfig.Config.CacheSize,
+		BlockSize:                  baidupcs.MaxDownloadRangeSize,
+		MaxRate:                    pcsconfig.Config.MaxDownloadRate,
+		InstanceStateStorageFormat: downloader.InstanceStateStorageFormatProto3,
+		IsTest:                     options.IsTest,
+		TryHTTP:                    !pcsconfig.Config.EnableHTTPS,
 	}
 
 	// 设置下载最大并发量
 	if options.Parallel < 1 {
-		options.Parallel = pcsconfig.Config.MaxParallel()
+		options.Parallel = pcsconfig.Config.MaxParallel
 	}
 
 	paths, err := matchPathByShellPattern(paths...)
@@ -408,7 +394,7 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 			switch {
 			case err == ErrDownloadNotSupportChecksum:
 				fallthrough
-			case strings.Compare(errManifest, StrDownloadFailed) == 0 && strings.Contains(err.Error(), StrDownloadInitError):
+			case errManifest == StrDownloadFailed && strings.Contains(err.Error(), StrDownloadInitError):
 				fmt.Fprintf(options.Out, "[%d] %s, %s\n", task.ID, errManifest, err)
 				MsgBody = fmt.Sprintf("{\"LastID\": %d, \"errManifest\": \"%s\", \"error\": \"%s\"}", task.ID, errManifest, err)
 				err = sendResponse(conn, 2, -1, "下载文件错误", MsgBody)
@@ -442,44 +428,41 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 			}
 		}
 		startTime = time.Now()
-		wg        = waitgroup.NewWaitGroup(options.Load)
 	)
 
 	for {
-		e := dlist.Shift()
-		if e == nil { // 任务为空
-			if wg.Parallel() == 0 { // 结束
+		// Wait之后不能再add了，重建一个wg
+		wg := waitgroup.NewWaitGroup(options.Load)
+		for {
+			e := dlist.Shift()
+			if e == nil { // 任务为空
 				break
-			} else {
-				time.Sleep(1e9)
-				continue
 			}
-		}
 
-		task := e.(*dtask)
-		wg.AddDelta()
-		go func() {
-			defer wg.Done()
+			task := e.(*dtask)
+			wg.AddDelta()
+			go func() {
+				defer wg.Done()
 
-			if task.downloadInfo == nil {
-				task.downloadInfo, err = pcs.FilesDirectoriesMeta(task.path)
-				if err != nil {
-					// 不重试
-					MsgBody = fmt.Sprintf("{\"LastID\": %d, \"error\": \"%s\"}", task.ID, err)
+				if task.downloadInfo == nil {
+					task.downloadInfo, err = pcs.FilesDirectoriesMeta(task.path)
+					if err != nil {
+						// 不重试
+						fmt.Printf("[%d] 获取路径信息错误, %s\n", task.ID, err)
+						MsgBody = fmt.Sprintf("{\"LastID\": %d, \"error\": \"%s\"}", task.ID, err)
 					sendResponse(conn, 2, -3, "获取路径信息错误", MsgBody)
-					fmt.Printf("[%d] 获取路径信息错误, %s\n", task.ID, err)
-					return
+						return
+					}
 				}
-			}
 
-			fmt.Fprintf(options.Out, "\n")
-			fmt.Fprintf(options.Out, "[%d] ----\n%s\n", task.ID, task.downloadInfo.String())
+				fmt.Fprintf(options.Out, "\n")
+				fmt.Fprintf(options.Out, "[%d] ----\n%s\n", task.ID, task.downloadInfo.String())
 
-			// 如果是一个目录, 将子文件和子目录加入队列
-			if task.downloadInfo.Isdir {
-				if !options.IsTest { // 测试下载, 不建立空目录
-					os.MkdirAll(task.savePath, 0777) // 首先在本地创建目录, 保证空目录也能被保存
-				}
+				// 如果是一个目录, 将子文件和子目录加入队列
+				if task.downloadInfo.Isdir {
+					if !options.IsTest { // 测试下载, 不建立空目录
+						os.MkdirAll(task.savePath, 0777) // 首先在本地创建目录, 保证空目录也能被保存
+					}
 
 				fileList, err := pcs.FilesDirectoriesList(task.path, baidupcs.DefaultOrderOptions)
 				if err != nil {
@@ -490,6 +473,7 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 					return
 				}
 
+				
 				MsgBody = fmt.Sprintf("{\"LastID\": %d}", task.ID)
 				sendResponse(conn, 2, 8, "删除文件夹任务", MsgBody)
 
@@ -571,76 +555,81 @@ func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions)
 				}
 			}
 
-			if (options.IsShareDownload || options.IsLocateDownload || options.IsLocatePanAPIDownload) && err == nil {
-				pcsCommandVerbose.Infof("[%d] 获取到下载链接: %s\n", task.ID, dlink)
-				client := pcsconfig.Config.HTTPClient()
-				client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-					// 去掉 Referer
-					if !pcsconfig.Config.EnableHTTPS() {
-						req.Header.Del("Referer")
+				if (options.IsShareDownload || options.IsLocateDownload || options.IsLocatePanAPIDownload) && err == nil {
+					pcsCommandVerbose.Infof("[%d] 获取到下载链接: %s\n", task.ID, dlink)
+					client := pcsconfig.Config.PanHTTPClient()
+					client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+						// 去掉 Referer
+						if !pcsconfig.Config.EnableHTTPS {
+							req.Header.Del("Referer")
+						}
+						if len(via) >= 10 {
+							return errors.New("stopped after 10 redirects")
+						}
+						return nil
 					}
-					if len(via) >= 10 {
-						return errors.New("stopped after 10 redirects")
-					}
-					return nil
-				}
-				client.SetTimeout(20 * time.Minute)
-				client.SetKeepAlive(true)
-				err = download(conn, task.ID, dlink, task.savePath, dlinks, client, *cfg, options)
-			} else {
-				if options.IsShareDownload || options.IsLocateDownload || options.IsLocatePanAPIDownload {
-					fmt.Fprintf(options.Out, "[%d] 错误: %s, 将使用默认的下载方式\n", task.ID, err)
-				}
-
-				dfunc := func(downloadURL string, jar http.CookieJar) error {
-					h := pcsconfig.Config.HTTPClient()
-					h.SetCookiejar(jar)
-					h.SetKeepAlive(true)
-					h.SetTimeout(10 * time.Minute)
-
-					err := download(conn, task.ID, downloadURL, task.savePath, dlinks, h, *cfg, options)
-					if err != nil {
-						return err
-					}
-
-					return nil
-				}
-				if options.IsStreaming {
-					err = pcs.DownloadStreamFile(task.path, dfunc)
+					client.SetTimeout(20 * time.Minute)
+					client.SetKeepAlive(true)
+					err = download(conn, task.ID, task.downloadInfo, dlink, task.savePath, dlinks, client, *cfg, options)
 				} else {
-					err = pcs.DownloadFile(task.path, dfunc)
-				}
-			}
+					if options.IsShareDownload || options.IsLocateDownload || options.IsLocatePanAPIDownload {
+						fmt.Fprintf(options.Out, "[%d] 错误: %s, 将使用默认的下载方式\n", task.ID, err)
+					}
 
-			if err != nil {
-				handleTaskErr(task, StrDownloadFailed, err)
-				return
-			}
+					dfunc := func(downloadURL string, jar http.CookieJar) error {
+						h := pcsconfig.Config.PCSHTTPClient()
+						h.SetCookiejar(jar)
+						h.SetKeepAlive(true)
+						h.SetTimeout(10 * time.Minute)
 
-			// 检验文件有效性
-			if !cfg.IsTest && !options.NoCheck {
-				if task.downloadInfo.Size >= 128*converter.MB {
-					fmt.Fprintf(options.Out, "[%d] 开始检验文件有效性, 稍后...\n", task.ID)
-				}
-				err = checkFileValid(task.savePath, task.downloadInfo)
-				if err != nil {
-					switch err {
-					case ErrDownloadFileBanned:
-						fmt.Fprintf(options.Out, "[%d] 检验文件有效性: %s\n", task.ID, err)
-						return
-					default:
-						handleTaskErr(task, "检验文件有效性出错", err)
-						return
+						err := download(conn, task.ID, task.downloadInfo, downloadURL, task.savePath, dlinks, h, *cfg, options)
+						if err != nil {
+							return err
+						}
+
+						return nil
+					}
+					if options.IsStreaming {
+						err = pcs.DownloadStreamFile(task.path, dfunc)
+					} else {
+						err = pcs.DownloadFile(task.path, dfunc)
 					}
 				}
+				if err != nil {
+					handleTaskErr(task, StrDownloadFailed, err)
+					return
+				}
 
-				fmt.Fprintf(options.Out, "[%d] 检验文件有效性成功\n", task.ID)
-			}
+				// 检验文件有效性
+				if !cfg.IsTest && !options.NoCheck {
+					if task.downloadInfo.Size >= 128*converter.MB {
+						fmt.Fprintf(options.Out, "[%d] 开始检验文件有效性, 请稍候...\n", task.ID)
+					}
+					err = checkFileValid(task.savePath, task.downloadInfo)
+					if err != nil {
+						switch err {
+						case ErrDownloadFileBanned:
+							fmt.Fprintf(options.Out, "[%d] 检验文件有效性: %s\n", task.ID, err)
+							return
+						default:
+							handleTaskErr(task, "检验文件有效性出错", err)
+							return
+						}
+					}
 
-			atomic.AddInt64(&totalSize, task.downloadInfo.Size)
-		}()
+					fmt.Fprintf(options.Out, "[%d] 检验文件有效性成功\n", task.ID)
+				}
+
+				atomic.AddInt64(&totalSize, task.downloadInfo.Size)
+			}()
+		}
+		wg.Wait()
+
+		// 没有任务了
+		if dlist.Size() == 0 {
+			break
+		}
 	}
-	wg.Wait()
 
 	fmt.Fprintf(options.Out, "\n任务结束, 时间: %s, 数据总量: %s\n", time.Since(startTime)/1e6*1e6, converter.ConvertFileSize(totalSize))
 	if len(failedList) != 0 {
@@ -716,13 +705,13 @@ func RunLocateDownload(pcspaths []string, opt *LocateDownloadOption) {
 		fmt.Printf("[%d] %s: \n", i, pcspath)
 		tb := pcstable.NewTable(os.Stdout)
 		tb.SetHeader([]string{"#", "链接"})
-		for k, u := range info.URLStrings(pcsconfig.Config.EnableHTTPS()) {
+		for k, u := range info.URLStrings(pcsconfig.Config.EnableHTTPS) {
 			tb.Append([]string{strconv.Itoa(k), u.String()})
 		}
 		tb.Render()
 		fmt.Println()
 	}
-	fmt.Printf("提示: 访问下载链接, 需将下载器的 User-Agent 设置为: %s\n", pcsconfig.Config.UserAgent())
+	fmt.Printf("提示: 访问下载链接, 需将下载器的 User-Agent 设置为: %s\n", pcsconfig.Config.PanUA)
 }
 
 // RunFixMD5 执行修复md5
@@ -762,7 +751,7 @@ func getLocateDownloadLinks(pcspath string) (dlinks []*url.URL, err error) {
 		return nil, pcsError
 	}
 
-	us := dInfo.URLStrings(pcsconfig.Config.EnableHTTPS())
+	us := dInfo.URLStrings(pcsconfig.Config.EnableHTTPS)
 	if len(us) == 0 {
 		return nil, ErrDlinkNotFound
 	}
@@ -787,16 +776,13 @@ func getLocatePanLink(pcs *baidupcs.BaiduPCS, fsID int64) (dlink string, err err
 		return "", ErrDlinkNotFound
 	}
 
-	dc := dlinkclient.NewDlinkClient()
-	c := pcsconfig.Config.HTTPClient()
-	c.SetResponseHeaderTimeout(30 * time.Second)
-	dc.SetClient(c)
+	dc := pcsconfig.Config.DlinkClient()
 	dlink, err = dc.CacheLinkRedirectPr(link)
 	return
 }
 
 func handleHTTPLinkURL(linkURL *url.URL) {
-	if pcsconfig.Config.EnableHTTPS() {
+	if pcsconfig.Config.EnableHTTPS {
 		if linkURL.Scheme == "http" {
 			linkURL.Scheme = "https"
 		}

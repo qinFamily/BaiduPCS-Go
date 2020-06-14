@@ -5,6 +5,7 @@ import (
 	"github.com/bitly/go-simplejson"
 	"github.com/iikira/Baidu-Login"
 	"github.com/iikira/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/iikira/BaiduPCS-Go/internal/pcsfunctions/pcscaptcha"
 	"golang.org/x/net/websocket"
 )
 
@@ -30,6 +31,11 @@ func WSLogin(conn *websocket.Conn, rJson *simplejson.Json) (err error) {
 		vcodestr              string
 		BDUSS, PToken, SToken string
 	)
+	
+	defer func() {
+		pcscaptcha.RemoveCaptchaPath()
+		pcscaptcha.RemoveOldCaptchaPath()
+	}()
 
 	username, _ := rJson.Get("username").String()
 	password, _ := rJson.Get("password").String()
@@ -68,7 +74,11 @@ func WSLogin(conn *websocket.Conn, rJson *simplejson.Json) (err error) {
 			sendResponse(conn, 1, 5, "账号或密码错误", "")
 		case "500001", "500002": // 验证码
 			if lj.ErrInfo.No == "500002" {
-				sendResponse(conn, 1, 4, "验证码错误", "")
+				if vcode != "" {
+					sendResponse(conn, 1, 4, "验证码错误", "")
+				} else {
+					lj = bc.BaiduLogin(username, password, "ABCD", vcodestr)
+				}
 			}
 			vcodestr = lj.Data.CodeString
 			if vcodestr == "" {
@@ -96,14 +106,13 @@ loginSuccess:
 	fmt.Println("百度帐号登录成功:", baidu.Name)
 	sendResponse(conn, 1, 7, baidu.Name, "")
 
-	println("globalSessions", GlobalSessions)
 	GlobalSessions.WebSocketUnLock(conn.Request())
 
-	err = pcsconfig.Config.Save()
-	if err != nil {
+	if err = pcsconfig.Config.Save(); err != nil {
 		fmt.Printf("保存配置错误: %s\n", err)
+	} else {
+		fmt.Printf("保存配置成功\n")
 	}
-	fmt.Printf("保存配置成功\n")
 	return err
 }
 

@@ -1,5 +1,3 @@
-#!/bin/sh
-
 name="BaiduPCS-Go"
 version=$1
 
@@ -7,7 +5,7 @@ GOROOT=/usr/lib/go-1.10
 go=$GOROOT/bin/go
 
 if [ "$1" = "" ];then
-    version=3.6.8
+    version=3.7.0
 fi
 
 output="out/"
@@ -64,12 +62,12 @@ RicePack() {
 #Build $name-$version"-mac-amd64" darwin amd64
 
 # Android
-ArmBuild $name-$version"-android-arm64" android arm64 7
-ArmBuild $name-$version"-android-amd64" android amd64 7
+#ArmBuild $name-$version"-android-arm64" android arm64 7
+#ArmBuild $name-$version"-android-amd64" android amd64 7
 
 ## Windows
-#Build $name-$version"-windows-86" windows 386
-#Build $name-$version"-windows-amd64" windows amd64
+Build $name-$version"-windows-86" windows 386
+Build $name-$version"-windows-amd64" windows amd64
 #
 ## Linux
 #Build $name-$version"-linux-86" linux 386
